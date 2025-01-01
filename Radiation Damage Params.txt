@@ -1,0 +1,5 @@
+size = 50  # Lattice size
+iterations = 1000000  # Number of iterations
+temperature = 2.0  # Temperature for Metropolis algorithm
+given_energy = 300  # Energy of radiation in MeV
+thickness = 1  # Thickness of the material in cm
