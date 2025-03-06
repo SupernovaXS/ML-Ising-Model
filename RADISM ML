@@ -1,0 +1,1135 @@
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
+from sklearn.preprocessing import StandardScaler
+import xgboost as xgb
+
+# Define diffusivity values for training and testing
+# These can be customized for different training/testing splits
+TRAIN_DIFFUSIVITIES = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5]
+TEST_DIFFUSIVITIES = [5.0, 5.5, 6.0]
+
+class InterpolativeRADISMModel:
+    """
+    Interpolative XGBoost-based Machine Learning model for RADISM project.
+    Instead of extrapolating to higher diffusivity values, this model uses
+    an interpolation approach by training on a subset of diffusivity values
+    and testing on the remaining ones within the same range.
+    """
+    
+    def __init__(self, data_path, train_diffusivities=None, test_diffusivities=None):
+        """
+        Initialize with path to simulation results CSV and optional lists of 
+        diffusivity values for training and testing.
+        
+        Parameters:
+        -----------
+        data_path : str
+            Path to the CSV file containing simulation results
+        train_diffusivities : list, optional
+            List of diffusivity values to use for training
+        test_diffusivities : list, optional
+            List of diffusivity values to use for testing
+        """
+        self.data_path = data_path
+        self.data = None
+        self.stats_data = None
+        self.X_train = None
+        self.X_test = None
+        self.y_train = None
+        self.y_test = None
+        self.models = {}
+        self.best_models = {}
+        self.scalers = {}
+        self.metrics = {}
+        self.train_diffusivities = train_diffusivities
+        self.test_diffusivities = test_diffusivities
+        
+    def load_data(self):
+        """Load the simulation data"""
+        print("Loading simulation data...")
+        self.data = pd.read_csv(self.data_path)
+        # Rename columns if needed to match the expected format
+        if 'final_magnetization' in self.data.columns and 'magnetization' not in self.data.columns:
+            self.data['magnetization'] = self.data['final_magnetization']
+        print(f"Loaded {len(self.data)} datapoints.")
+        
+        # Print the columns and a sample of the data
+        print(f"Columns in dataset: {self.data.columns.tolist()}")
+        print("\nSample data:")
+        print(self.data.head())
+        
+        return self.data
+    
+    def compute_statistical_features(self):
+        """
+        Compute statistical features for each parameter combination to handle bistability
+        """
+        print("Computing statistical features for each parameter combination...")
+        
+        # Make sure we have the correct magnetization column
+        magnetization_col = 'final_magnetization' if 'final_magnetization' in self.data.columns else 'magnetization'
+        
+        # Group by diffusivity, PKA energy, and h0 if it varies
+        if 'h0' in self.data.columns and self.data['h0'].nunique() > 1:
+            print(f"Grouping by diffusivity, pka_energy, and h0 (found {self.data['h0'].nunique()} h0 values)")
+            group_cols = ['diffusivity', 'pka_energy', 'h0']
+        else:
+            print("Grouping by diffusivity and pka_energy")
+            group_cols = ['diffusivity', 'pka_energy']
+        
+        # Compute statistics for each group
+        stats = self.data.groupby(group_cols).agg({
+            magnetization_col: [
+                'mean',              # Average magnetization
+                'std',               # Standard deviation (captures bistability)
+                lambda x: (x > 0).mean(),  # Probability of positive magnetization
+                lambda x: np.abs(x).mean(),  # Average absolute magnetization
+                lambda x: np.percentile(x, 25),  # 25th percentile
+                lambda x: np.percentile(x, 75),  # 75th percentile
+                'count'              # Number of samples (should be 25 for each)
+            ]
+        })
+        
+        # Flatten the column hierarchy
+        stats.columns = ['mean_mag', 'std_mag', 'prob_positive', 'abs_mag', 'percentile_25', 'percentile_75', 'count']
+        stats = stats.reset_index()
+        
+        # Calculate bimodality coefficient
+        # Formula: (skewness^2 + 1) / (kurtosis + 3*(n-1)^2/(n-2)*(n-3))
+        # We'll use a simplified approximation with std and abs_mean
+        stats['bimodality'] = stats['std_mag'] / stats['mean_mag'].abs()
+        stats['bimodality'] = stats['bimodality'].fillna(0)  # Handle division by zero
+        
+        self.stats_data = stats
+        print(f"Created statistical dataset with {len(stats)} parameter combinations.")
+        
+        # Print distribution of data by diffusivity
+        diff_counts = stats['diffusivity'].value_counts().sort_index()
+        print("\nDistribution by diffusivity:")
+        print(diff_counts)
+        
+        return self.stats_data
+    
+    def split_data_for_interpolation(self, target='mean_mag', test_size=0.3, random_state=42, stratify_by_diffusivity=True):
+        """
+        Split data for interpolation testing based on either predefined diffusivity lists
+        or by randomly selecting diffusivity values.
+        
+        Parameters:
+        -----------
+        target : str, default='mean_mag'
+            The target variable to predict
+        test_size : float, default=0.3
+            Fraction of diffusivity values to use for testing (only used if train_diffusivities 
+            and test_diffusivities are not provided)
+        random_state : int, default=42
+            Random seed for reproducibility (only used for random selection)
+        stratify_by_diffusivity : bool, default=True
+            If True, stratify the split by diffusivity values (only used for random selection)
+        """
+        if self.stats_data is None:
+            raise ValueError("No statistical data available. Run compute_statistical_features first.")
+        
+        # Get all available diffusivity values in the dataset
+        available_diffusivities = np.sort(self.stats_data['diffusivity'].unique())
+        
+        # Handle the case where diffusivity lists are provided
+        if self.train_diffusivities is not None and self.test_diffusivities is not None:
+            train_diffusivities = np.array(self.train_diffusivities)
+            test_diffusivities = np.array(self.test_diffusivities)
+            
+            # Check for overlap
+            overlap = np.intersect1d(train_diffusivities, test_diffusivities)
+            if len(overlap) > 0:
+                raise ValueError(f"Train and test diffusivity lists overlap: {overlap}")
+                
+            # Check if all specified diffusivities exist in the dataset
+            all_diffusivities = np.concatenate([train_diffusivities, test_diffusivities])
+            missing = np.setdiff1d(all_diffusivities, available_diffusivities)
+            if len(missing) > 0:
+                raise ValueError(f"Some specified diffusivity values are not in the dataset: {missing}")
+                
+            print(f"Using {len(train_diffusivities)} predefined diffusivity values for training: {train_diffusivities}")
+            print(f"Using {len(test_diffusivities)} predefined diffusivity values for testing: {test_diffusivities}")
+            
+        # Otherwise, randomly select diffusivity values
+        else:
+            num_diffusivities = len(available_diffusivities)
+            num_test = max(1, int(round(num_diffusivities * test_size)))
+            
+            # Randomly select diffusivity values for testing
+            np.random.seed(random_state)
+            test_indices = np.random.choice(num_diffusivities, num_test, replace=False)
+            test_diffusivities = available_diffusivities[test_indices]
+            train_diffusivities = np.setdiff1d(available_diffusivities, test_diffusivities)
+            
+            print(f"Randomly selected {len(test_diffusivities)} diffusivity values for testing: {test_diffusivities}")
+            print(f"Using {len(train_diffusivities)} diffusivity values for training")
+        
+        # Update the instance variables
+        self.train_diffusivities = train_diffusivities
+        self.test_diffusivities = test_diffusivities
+        
+        # Split data based on diffusivity values
+        train_mask = self.stats_data['diffusivity'].isin(train_diffusivities)
+        test_mask = self.stats_data['diffusivity'].isin(test_diffusivities)
+        
+        train_data = self.stats_data[train_mask]
+        test_data = self.stats_data[test_mask]
+        
+        print(f"Training data: {len(train_data)} samples")
+        print(f"Testing data: {len(test_data)} samples")
+        
+        # Include h0 as a feature if it varies in the dataset
+        if 'h0' in self.stats_data.columns and self.stats_data['h0'].nunique() > 1:
+            feature_cols = ['diffusivity', 'pka_energy', 'h0']
+            print("Including h0 as a feature in the model")
+        else:
+            feature_cols = ['diffusivity', 'pka_energy']
+        
+        # Extract features and target
+        self.X_train = train_data[feature_cols]
+        self.y_train = train_data[target]
+        self.X_test = test_data[feature_cols]
+        self.y_test = test_data[target]
+        
+        return self.X_train, self.X_test, self.y_train, self.y_test
+    
+    def train_xgboost_model(self, target='mean_mag'):
+        """Train XGBoost model with hyperparameter tuning"""
+        print(f"Training XGBoost model to predict {target}...")
+        
+        # Split data if not already done
+        if self.X_train is None:
+            self.split_data_for_interpolation(target=target)
+        
+        # Create a scaler for this target
+        scaler = StandardScaler()
+        y_train_scaled = scaler.fit_transform(self.y_train.values.reshape(-1, 1)).ravel()
+        self.scalers[target] = scaler
+        
+        # Define parameter grid for XGBoost
+        param_grid = {
+            'n_estimators': [100, 200, 300],
+            'learning_rate': [0.01, 0.05, 0.1],
+            'max_depth': [3, 5, 7],
+            'subsample': [0.8, 1.0],
+            'colsample_bytree': [0.8, 1.0],
+            'gamma': [0, 0.1]
+        }
+        
+        # Use GridSearchCV for hyperparameter tuning
+        xgb_model = xgb.XGBRegressor(random_state=42)
+        grid_search = GridSearchCV(
+            xgb_model, 
+            param_grid, 
+            cv=5, 
+            scoring='neg_mean_squared_error',
+            n_jobs=-1,
+            verbose=1
+        )
+        
+        grid_search.fit(self.X_train, y_train_scaled)
+        best_model = grid_search.best_estimator_
+        
+        print(f"Best parameters: {grid_search.best_params_}")
+        print(f"Best CV score: {-grid_search.best_score_:.6f}")
+        
+        # Store model
+        self.best_models[target] = best_model
+        
+        # Evaluate on test set (interpolation performance)
+        y_pred_scaled = best_model.predict(self.X_test)
+        y_pred = scaler.inverse_transform(y_pred_scaled.reshape(-1, 1)).ravel()
+        
+        # Calculate metrics
+        metrics = {
+            'mse': mean_squared_error(self.y_test, y_pred),
+            'rmse': np.sqrt(mean_squared_error(self.y_test, y_pred)),
+            'mae': mean_absolute_error(self.y_test, y_pred),
+            'r2': r2_score(self.y_test, y_pred),
+            'max_error': np.max(np.abs(self.y_test - y_pred))
+        }
+        
+        self.metrics[target] = metrics
+        
+        print(f"Interpolation performance on test set:")
+        for metric_name, value in metrics.items():
+            print(f"  {metric_name}: {value:.6f}")
+        
+        return best_model, metrics
+    
+    def train_all_targets(self):
+        """Train models for all relevant statistical targets"""
+        targets = ['mean_mag', 'std_mag', 'prob_positive', 'abs_mag', 'bimodality']
+        results = {}
+        
+        for target in targets:
+            print(f"\n{'='*50}")
+            print(f"Training model for {target}")
+            print(f"{'='*50}")
+            # Use the same train/test split for all targets
+            if self.X_train is None:
+                self.split_data_for_interpolation(target=target)
+            model, metrics = self.train_xgboost_model(target=target)
+            results[target] = metrics
+        
+        # Summarize overall performance
+        print("\nSummary of interpolation performance:")
+        for target, metrics in results.items():
+            print(f"{target}:")
+            print(f"  RMSE: {metrics['rmse']:.6f}, R²: {metrics['r2']:.6f}")
+        
+        return results
+    
+    def predict(self, diffusivity, pka_energy, h0=None, target='mean_mag'):
+        """Make predictions using the trained model"""
+        if target not in self.best_models:
+            raise ValueError(f"No trained model available for {target}. Run train_models first.")
+        
+        # Create input data
+        if h0 is not None and 'h0' in self.stats_data.columns and self.stats_data['h0'].nunique() > 1:
+            X_pred = pd.DataFrame({'diffusivity': [diffusivity], 'pka_energy': [pka_energy], 'h0': [h0]})
+        else:
+            X_pred = pd.DataFrame({'diffusivity': [diffusivity], 'pka_energy': [pka_energy]})
+        
+        # Make prediction and inverse transform
+        scaled_pred = self.best_models[target].predict(X_pred)
+        prediction = self.scalers[target].inverse_transform(scaled_pred.reshape(-1, 1)).ravel()[0]
+        
+        return prediction
+    
+    def predict_magnetization_profile(self, diffusivity, pka_energy_range=None, h0=None):
+        """
+        Predict complete magnetization profile for a given diffusivity across PKA energies
+        """
+        if pka_energy_range is None:
+            pka_energy_range = np.arange(5000, 7600, 100)
+        
+        results = {
+            'pka_energy': pka_energy_range,
+            'mean_mag': [],
+            'std_mag': [],
+            'prob_positive': [],
+            'bimodality': []
+        }
+        
+        for pka in pka_energy_range:
+            for target in ['mean_mag', 'std_mag', 'prob_positive', 'bimodality']:
+                if target in self.best_models:
+                    pred = self.predict(diffusivity, pka, h0=h0, target=target)
+                    results[target].append(pred)
+                else:
+                    results[target].append(None)
+        
+        return pd.DataFrame(results)
+    
+    def calculate_auc(self, diffusivity, h0=None, pka_min=5000, pka_max=7500, baseline=-1, method='simpson'):
+        """
+        Calculate the area under the magnetization curve for a given diffusivity
+        """
+        if 'mean_mag' not in self.best_models:
+            raise ValueError("No model trained for mean_mag. Run train_models first.")
+
+        # Generate predictions across the PKA energy range
+        pka_range = np.linspace(pka_min, pka_max, 100)
+        predictions = self.predict_magnetization_profile(diffusivity, pka_range, h0=h0)
+        
+        # Extract x and y values
+        x = predictions['pka_energy']
+        y = predictions['mean_mag']
+        
+        # Calculate area above baseline
+        y_above = np.maximum(y - baseline, 0)
+        positive_area = np.trapz(y_above, x)
+        
+        # Calculate area below baseline
+        y_below = np.maximum(baseline - y, 0)
+        negative_area = np.trapz(y_below, x)
+        
+        return {
+            'positive_area': positive_area,
+            'negative_area': negative_area,
+            'net_area': positive_area - negative_area
+        }
+    
+    def _get_zero_crossing_from_data(self, diffusivity):
+        """Extract the zero crossing point from actual data"""
+        data = self.stats_data[self.stats_data['diffusivity'] == diffusivity]
+        if len(data) < 2:
+            return None
+            
+        # Sort by PKA energy
+        data = data.sort_values('pka_energy')
+        
+        # Find sign changes
+        signs = np.sign(data['mean_mag'])
+        sign_changes = ((np.roll(signs, 1) - signs) != 0).astype(int)
+        sign_changes.iloc[0] = 0  # First element can't be a sign change
+        
+        # Get the PKA energy where sign changes
+        if np.sum(sign_changes) > 0:
+            # Find the first crossing
+            crossing_idx = np.where(sign_changes == 1)[0][0]
+            # Linear interpolation for more precise estimate
+            if crossing_idx > 0:
+                x1 = data['pka_energy'].iloc[crossing_idx-1]
+                x2 = data['pka_energy'].iloc[crossing_idx]
+                y1 = data['mean_mag'].iloc[crossing_idx-1]
+                y2 = data['mean_mag'].iloc[crossing_idx]
+                zero_crossing = x1 + (x2 - x1) * (-y1) / (y2 - y1)
+                return zero_crossing
+        
+        return None
+    
+    def _get_auc_from_data(self, diffusivity, baseline=-1, method='simpson', pka_min=None, pka_max=None):
+        """
+        Calculate AUC from actual data using the simpson method
+        """
+        # Get data for this diffusivity
+        data = self.stats_data[self.stats_data['diffusivity'] == diffusivity]
+        if len(data) < 2:
+            return None
+            
+        # Sort by PKA energy
+        data = data.sort_values('pka_energy')
+        
+        # Extract x and y values
+        x = data['pka_energy']
+        y = data['mean_mag']
+        
+        # Limit to specified PKA range if provided
+        if pka_min is not None or pka_max is not None:
+            if pka_min is None:
+                pka_min = x.min()
+            if pka_max is None:
+                pka_max = x.max()
+            
+            mask = (x >= pka_min) & (x <= pka_max)
+            x = x[mask]
+            y = y[mask]
+        
+        # Calculate area above baseline
+        y_above = np.maximum(y - baseline, 0)
+        positive_area = np.trapz(y_above, x)
+        
+        # Calculate area below baseline
+        y_below = np.maximum(baseline - y, 0)
+        negative_area = np.trapz(y_below, x)
+        
+        return {
+            'positive_area': positive_area,
+            'negative_area': negative_area,
+            'net_area': positive_area - negative_area
+        }
+    
+    def estimate_zero_crossing(self, diffusivity, h0=None):
+        """
+        Estimate the PKA energy at which magnetization crosses zero for a given diffusivity
+        """
+        if 'mean_mag' not in self.best_models:
+            raise ValueError("No model trained for mean_mag. Run train_models first.")
+            
+        # Generate predictions across a fine-grained PKA energy range
+        pka_range = np.arange(5000, 7600, 10)  # 10-unit steps for higher precision
+        predictions = self.predict_magnetization_profile(diffusivity, pka_range, h0=h0)
+        
+        # Find where magnetization crosses zero (sign changes)
+        signs = np.sign(predictions['mean_mag'])
+        sign_changes = ((np.roll(signs, 1) - signs) != 0).astype(int)
+        sign_changes[0] = 0  # First element can't be a sign change
+        
+        # Get the PKA energy where sign changes
+        if np.sum(sign_changes) > 0:
+            # Find the first crossing
+            crossing_idx = np.where(sign_changes == 1)[0][0]
+            # Linear interpolation for more precise estimate
+            x1, x2 = pka_range[crossing_idx-1], pka_range[crossing_idx]
+            y1, y2 = predictions['mean_mag'].iloc[crossing_idx-1], predictions['mean_mag'].iloc[crossing_idx]
+            zero_crossing = x1 + (x2 - x1) * (-y1) / (y2 - y1)
+            return zero_crossing
+        else:
+            # No zero crossing found
+            return None
+    
+    def evaluate_interpolation_performance(self, baseline=-1, method='simpson'):
+        """
+        Evaluate interpolation performance on key metrics like zero-crossing and AUC
+        
+        Parameters:
+        -----------
+        baseline : float, default=-1
+            The baseline from which to measure the area
+        method : str, default='simpson'
+            Integration method to use
+                
+        Returns:
+        --------
+        pd.DataFrame
+            DataFrame containing evaluation metrics for each test diffusivity
+        """
+        if self.test_diffusivities is None:
+            raise ValueError("No test diffusivities defined. Run split_data_for_interpolation first.")
+        
+        results = []
+        
+        print("\nEvaluating interpolation performance for key metrics:")
+        
+        for diff in self.test_diffusivities:
+            # Get actual data for this diffusivity
+            actual_data = self.stats_data[self.stats_data['diffusivity'] == diff]
+            
+            # Create predicted curve
+            pka_range = np.unique(actual_data['pka_energy'])
+            predictions = self.predict_magnetization_profile(diff, pka_range)
+            
+            # Compare predicted vs actual mean magnetization
+            actual_values = {}
+            for pka in pka_range:
+                actual_row = actual_data[actual_data['pka_energy'] == pka]
+                if not actual_row.empty:
+                    for target in ['mean_mag', 'std_mag', 'prob_positive', 'bimodality']:
+                        if target not in actual_values:
+                            actual_values[target] = []
+                        actual_values[target].append(actual_row[target].iloc[0])
+            
+            # Calculate metrics
+            metrics = {}
+            for target in ['mean_mag', 'std_mag', 'prob_positive', 'bimodality']:
+                if target in actual_values and len(actual_values[target]) > 0:
+                    actual = np.array(actual_values[target])
+                    pred = np.array(predictions[target])
+                    metrics[f"{target}_mse"] = mean_squared_error(actual, pred)
+                    metrics[f"{target}_rmse"] = np.sqrt(metrics[f"{target}_mse"])
+                    metrics[f"{target}_r2"] = r2_score(actual, pred)
+            
+            # Estimate zero crossing
+            actual_zc = self._get_zero_crossing_from_data(diff)
+            predicted_zc = self.estimate_zero_crossing(diff)
+            
+            # Calculate AUC
+            try:
+                predicted_auc = self.calculate_auc(diff, baseline=baseline, method=method)
+                actual_auc = self._get_auc_from_data(diff, baseline=baseline, method=method)
+                
+                auc_metrics = {
+                    'auc_actual': actual_auc['positive_area'] if actual_auc else None,
+                    'auc_predicted': predicted_auc['positive_area'] if predicted_auc else None,
+                    'auc_error': abs(actual_auc['positive_area'] - predicted_auc['positive_area']) if (actual_auc and predicted_auc) else None,
+                    'negative_area_actual': actual_auc['negative_area'] if actual_auc else None,
+                    'negative_area_predicted': predicted_auc['negative_area'] if predicted_auc else None
+                }
+            except Exception as e:
+                print(f"Error calculating AUC for diffusivity {diff}: {e}")
+                auc_metrics = {
+                    'auc_actual': None,
+                    'auc_predicted': None,
+                    'auc_error': None,
+                    'negative_area_actual': None,
+                    'negative_area_predicted': None
+                }
+                
+            # Combine all metrics
+            result = {
+                'diffusivity': diff,
+                'zero_crossing_actual': actual_zc,
+                'zero_crossing_predicted': predicted_zc,
+                'zero_crossing_error': abs(actual_zc - predicted_zc) if (actual_zc and predicted_zc) else None,
+                **auc_metrics,
+                **metrics
+            }
+            
+            results.append(result)
+            
+            print(f"\nInterpolation performance for diffusivity {diff}:")
+            print(f"  Using baseline: {baseline}, method: {method}")
+            for key, value in result.items():
+                if isinstance(value, (float, int)) and key != 'diffusivity':
+                    print(f"  {key}: {value:.4f}")
+                elif key != 'diffusivity':
+                    print(f"  {key}: {value}")
+        
+        results_df = pd.DataFrame(results)
+        
+        # Calculate average metrics
+        avg_metrics = {
+            'mean_auc_error': results_df['auc_error'].mean(),
+            'mean_zero_crossing_error': results_df['zero_crossing_error'].mean(),
+            'mean_mag_rmse': results_df['mean_mag_rmse'].mean(),
+            'mean_mag_r2': results_df['mean_mag_r2'].mean()
+        }
+        
+        print("\nAverage performance metrics:")
+        for metric, value in avg_metrics.items():
+            print(f"  {metric}: {value:.4f}")
+        
+        return results_df
+    
+    def plot_interpolation_comparison(self, baseline=-1, method='simpson'):
+        """
+        Plot comparison of actual vs predicted curves for interpolation diffusivity values
+        
+        Parameters:
+        -----------
+        baseline : float, default=-1
+            The baseline from which to measure the area
+        method : str, default='simpson'
+            Integration method to use
+        """
+        if self.test_diffusivities is None or not self.best_models:
+            raise ValueError("No test diffusivities or trained models available.")
+        
+        # Create a multi-panel plot
+        fig, axs = plt.subplots(len(self.test_diffusivities), 1, figsize=(12, 5*len(self.test_diffusivities)))
+        if len(self.test_diffusivities) == 1:
+            axs = [axs]
+        
+        for i, diff in enumerate(self.test_diffusivities):
+            ax = axs[i]
+            
+            # Get actual data
+            actual_data = self.stats_data[self.stats_data['diffusivity'] == diff]
+            
+            # Generate predictions
+            pka_range = np.arange(5000, 7600, 50)  # Smoother curve for visualization
+            predictions = self.predict_magnetization_profile(diff, pka_range)
+            
+            # Plot predicted curve
+            ax.plot(
+                predictions['pka_energy'], 
+                predictions['mean_mag'],
+                'b-', 
+                linewidth=2,
+                label='XGBoost Model Prediction'
+            )
+            
+            # Plot actual data points
+            if not actual_data.empty:
+                ax.scatter(
+                    actual_data['pka_energy'],
+                    actual_data['mean_mag'],
+                    color='red',
+                    s=80,
+                    label='Actual Data'
+                )
+                
+                # Connect actual data points
+                ax.plot(
+                    actual_data.sort_values('pka_energy')['pka_energy'],
+                    actual_data.sort_values('pka_energy')['mean_mag'],
+                    'r--',
+                    alpha=0.7
+                )
+            
+            # Add baseline
+            ax.axhline(y=baseline, color='green', linestyle='-', alpha=0.5, label=f'Baseline: {baseline}')
+            
+            # Add zero crossing lines if exists
+            zc_pred = self.estimate_zero_crossing(diff)
+            if zc_pred:
+                ax.axvline(x=zc_pred, color='blue', linestyle='--', alpha=0.5,
+                        label=f'Predicted Zero-Crossing: {zc_pred:.1f}')
+            
+            zc_actual = self._get_zero_crossing_from_data(diff)
+            if zc_actual:
+                ax.axvline(x=zc_actual, color='red', linestyle='--', alpha=0.5,
+                        label=f'Actual Zero-Crossing: {zc_actual:.1f}')
+            
+            # Calculate AUC with baseline
+            try:
+                pred_auc = self.calculate_auc(diff, baseline=baseline, method=method)
+                actual_auc = self._get_auc_from_data(diff, baseline=baseline, method=method)
+                
+                # Fill area above baseline
+                if not predictions.empty:
+                    # Sort by PKA energy to ensure correct filling
+                    sorted_pred = predictions.sort_values('pka_energy')
+                    x = sorted_pred['pka_energy']
+                    y = sorted_pred['mean_mag']
+                    
+                    # Fill area above baseline
+                    ax.fill_between(x, y, baseline, where=(y > baseline), 
+                                color='lightblue', alpha=0.3, label='Area Above Baseline (Positive)')
+                    
+                    # Fill area below baseline
+                    ax.fill_between(x, y, baseline, where=(y < baseline),
+                                color='lightcoral', alpha=0.3, label='Area Below Baseline (Negative)')
+                
+                # Add AUC information
+                if pred_auc and actual_auc:
+                    auc_text = f"Area above baseline (predicted): {pred_auc['positive_area']:.1f}\n"
+                    auc_text += f"Area above baseline (actual): {actual_auc['positive_area']:.1f}\n"
+                    auc_text += f"Error: {abs(actual_auc['positive_area'] - pred_auc['positive_area']):.1f}"
+                    
+                    ax.text(0.05, 0.95, auc_text, transform=ax.transAxes, fontsize=12,
+                            verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
+            except Exception as e:
+                print(f"Error calculating AUC for diffusivity {diff}: {e}")
+            
+            # Set title and labels
+            ax.set_title(f'Diffusivity = {diff}', fontsize=14)
+            ax.set_xlabel('PKA Energy', fontsize=12)
+            ax.set_ylabel('Mean Magnetization', fontsize=12)
+            ax.grid(True)
+            ax.legend(fontsize=10, loc='lower right')
+            ax.axhline(y=0, color='black', linestyle='--', alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig(f"radism_interpolation_comparison_baseline_{baseline}.png", dpi=300)
+        # Don't call plt.show() in non-interactive environments
+        
+    def evaluate_feature_importance(self):
+        """
+        Extract and plot feature importance from the XGBoost models
+        """
+        if not self.best_models:
+            raise ValueError("No trained models available. Train models first.")
+            
+        # Create a figure for feature importance
+        fig, axes = plt.subplots(len(self.best_models), 1, figsize=(10, 4*len(self.best_models)))
+        
+        # If only one target, convert axes to list
+        if len(self.best_models) == 1:
+            axes = [axes]
+            
+        for i, (target, model) in enumerate(self.best_models.items()):
+            ax = axes[i]
+            
+            # Get feature names
+            feature_names = self.X_train.columns.tolist()
+            
+            # Get feature importance
+            importance = model.feature_importances_
+            
+            # Sort features by importance
+            indices = np.argsort(importance)
+            
+            # Plot
+            ax.barh(range(len(indices)), importance[indices], align='center')
+            ax.set_yticks(range(len(indices)))
+            ax.set_yticklabels([feature_names[i] for i in indices])
+            ax.set_title(f'Feature Importance for {target}')
+            ax.set_xlabel('Relative Importance')
+            
+        plt.tight_layout()
+        plt.savefig("radism_interpolation_feature_importance.png", dpi=300)
+        # Don't call plt.show() in non-interactive environments
+        
+        # Return detailed feature importance for each model
+        importance_dict = {}
+        for target, model in self.best_models.items():
+            feature_names = self.X_train.columns.tolist()
+            importance = model.feature_importances_
+            
+            # Create sorted list of (feature, importance) tuples
+            importance_tuples = sorted(zip(feature_names, importance), key=lambda x: x[1], reverse=True)
+            importance_dict[target] = importance_tuples
+            
+        return importance_dict
+        
+    def plot_performance_by_diffusivity(self):
+        """
+        Plot performance metrics across different diffusivity values to visualize model behavior
+        """
+        if self.test_diffusivities is None or not self.best_models:
+            raise ValueError("No test diffusivities or trained models available.")
+            
+        # Create a range of diffusivity values to test
+        all_diffusivities = sorted(self.stats_data['diffusivity'].unique())
+        
+        # Predict AUC and zero-crossing for each diffusivity
+        results = []
+        
+        for diff in all_diffusivities:
+            # Check if this is a test diffusivity
+            is_test = diff in self.test_diffusivities
+            
+            # Calculate actual and predicted metrics
+            actual_zc = self._get_zero_crossing_from_data(diff)
+            predicted_zc = self.estimate_zero_crossing(diff)
+            
+            try:
+                actual_auc = self._get_auc_from_data(diff, baseline=-1)
+                predicted_auc = self.calculate_auc(diff, baseline=-1)
+                
+                result = {
+                    'diffusivity': diff,
+                    'is_test': is_test,
+                    'zero_crossing_actual': actual_zc,
+                    'zero_crossing_predicted': predicted_zc,
+                    'auc_actual': actual_auc['positive_area'] if actual_auc else None,
+                    'auc_predicted': predicted_auc['positive_area'] if predicted_auc else None
+                }
+                
+                results.append(result)
+            except Exception as e:
+                print(f"Error processing diffusivity {diff}: {e}")
+            
+        # Check if we have any results
+        if not results:
+            print("No valid results to plot. Check the error messages above.")
+            # Create an empty plot and save it
+            plt.figure(figsize=(12, 10))
+            plt.text(0.5, 0.5, "No valid data to display", 
+                    horizontalalignment='center', verticalalignment='center', fontsize=16)
+            plt.savefig("radism_performance_by_diffusivity.png", dpi=300)
+            return pd.DataFrame()
+        
+        # Convert to DataFrame
+        results_df = pd.DataFrame(results)
+        
+        # Create plot
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+        
+        # Define masks for test and training data
+        if 'is_test' in results_df.columns:
+            train_mask = ~results_df['is_test']
+            test_mask = results_df['is_test']
+            
+            # Plot 1: Zero-crossing predictions - only if we have data
+            if 'zero_crossing_actual' in results_df.columns:
+                # Training points
+                train_diff = results_df.loc[train_mask, 'diffusivity']
+                train_zc = results_df.loc[train_mask, 'zero_crossing_actual']
+                valid_train = ~train_zc.isna()
+                if valid_train.any():
+                    ax1.scatter(train_diff[valid_train], train_zc[valid_train], 
+                               color='blue', s=100, alpha=0.7, label='Training Data Actual')
+                
+                # Test points
+                test_diff = results_df.loc[test_mask, 'diffusivity']
+                test_zc = results_df.loc[test_mask, 'zero_crossing_actual']
+                valid_test = ~test_zc.isna()
+                if valid_test.any():
+                    ax1.scatter(test_diff[valid_test], test_zc[valid_test], 
+                               color='red', s=100, alpha=0.7, label='Test Data Actual')
+                
+                # Prediction line
+                valid_pred = ~results_df['zero_crossing_predicted'].isna()
+                if valid_pred.any():
+                    ax1.plot(results_df.loc[valid_pred, 'diffusivity'], 
+                             results_df.loc[valid_pred, 'zero_crossing_predicted'], 
+                             'k--', linewidth=2, label='Model Prediction')
+            
+            # Plot 2: AUC predictions - only if we have data
+            if 'auc_actual' in results_df.columns:
+                # Training points
+                train_diff = results_df.loc[train_mask, 'diffusivity']
+                train_auc = results_df.loc[train_mask, 'auc_actual']
+                valid_train = ~train_auc.isna()
+                if valid_train.any():
+                    ax2.scatter(train_diff[valid_train], train_auc[valid_train], 
+                               color='blue', s=100, alpha=0.7, label='Training Data Actual')
+                
+                # Test points
+                test_diff = results_df.loc[test_mask, 'diffusivity']
+                test_auc = results_df.loc[test_mask, 'auc_actual']
+                valid_test = ~test_auc.isna()
+                if valid_test.any():
+                    ax2.scatter(test_diff[valid_test], test_auc[valid_test], 
+                               color='red', s=100, alpha=0.7, label='Test Data Actual')
+                
+                # Prediction line
+                valid_pred = ~results_df['auc_predicted'].isna()
+                if valid_pred.any():
+                    ax2.plot(results_df.loc[valid_pred, 'diffusivity'], 
+                             results_df.loc[valid_pred, 'auc_predicted'], 
+                             'k--', linewidth=2, label='Model Prediction')
+        else:
+            print("Warning: 'is_test' column missing from results. Cannot differentiate test/train data.")
+            
+            # Simplified plotting without test/train distinction
+            if 'zero_crossing_actual' in results_df.columns:
+                valid = ~results_df['zero_crossing_actual'].isna()
+                if valid.any():
+                    ax1.scatter(results_df.loc[valid, 'diffusivity'], 
+                               results_df.loc[valid, 'zero_crossing_actual'], 
+                               color='green', s=100, alpha=0.7, label='Actual Data')
+                
+                valid_pred = ~results_df['zero_crossing_predicted'].isna()
+                if valid_pred.any():
+                    ax1.plot(results_df.loc[valid_pred, 'diffusivity'], 
+                             results_df.loc[valid_pred, 'zero_crossing_predicted'], 
+                             'k--', linewidth=2, label='Model Prediction')
+            
+            if 'auc_actual' in results_df.columns:
+                valid = ~results_df['auc_actual'].isna()
+                if valid.any():
+                    ax2.scatter(results_df.loc[valid, 'diffusivity'], 
+                               results_df.loc[valid, 'auc_actual'], 
+                               color='green', s=100, alpha=0.7, label='Actual Data')
+                
+                valid_pred = ~results_df['auc_predicted'].isna()
+                if valid_pred.any():
+                    ax2.plot(results_df.loc[valid_pred, 'diffusivity'], 
+                             results_df.loc[valid_pred, 'auc_predicted'], 
+                             'k--', linewidth=2, label='Model Prediction')
+        
+        # Set labels and formatting
+        ax1.set_ylabel('Zero-Crossing PKA Energy', fontsize=12)
+        ax1.set_title('Zero-Crossing Prediction Performance', fontsize=14)
+        ax1.grid(True)
+        ax1.legend()
+        
+        ax2.set_xlabel('Diffusivity', fontsize=12)
+        ax2.set_ylabel('Area Above Baseline', fontsize=12)
+        ax2.set_title('Area Above Baseline Prediction Performance', fontsize=14)
+        ax2.grid(True)
+        ax2.legend()
+        
+        plt.tight_layout()
+        plt.savefig("radism_performance_by_diffusivity.png", dpi=300)
+        print("Performance plot saved to radism_performance_by_diffusivity.png")
+        
+        return results_df
+        
+    def compare_with_extrapolation_model(self, extrapolation_model, test_diffusivities=[4.0, 4.5]):
+        """
+        Compare interpolation vs extrapolation model performance
+        
+        Parameters:
+        -----------
+        extrapolation_model : RADISMModel
+            An instance of the extrapolation model to compare with
+        test_diffusivities : list
+            List of diffusivity values to compare on
+        """
+        if not self.best_models or not extrapolation_model.best_models:
+            raise ValueError("Both models must be trained first.")
+            
+        comparison_results = []
+        
+        for diff in test_diffusivities:
+            # Get actual data
+            actual_data = self.stats_data[self.stats_data['diffusivity'] == diff]
+            
+            # Skip if no actual data for this diffusivity
+            if actual_data.empty:
+                continue
+                
+            # Get PKA energy values
+            pka_values = np.unique(actual_data['pka_energy'])
+            
+            # Get predictions from both models
+            interp_pred = self.predict_magnetization_profile(diff, pka_values)
+            extrap_pred = extrapolation_model.predict_magnetization_profile(diff, pka_values)
+            
+            # Extract actual values
+            actual_values = []
+            for pka in pka_values:
+                actual_row = actual_data[actual_data['pka_energy'] == pka]
+                if not actual_row.empty:
+                    actual_values.append(actual_row['mean_mag'].iloc[0])
+                else:
+                    actual_values.append(None)
+                    
+            actual_array = np.array([v for v in actual_values if v is not None])
+            
+            # Calculate metrics for each model
+            interp_metrics = {
+                'mse': mean_squared_error(actual_array, interp_pred['mean_mag']),
+                'rmse': np.sqrt(mean_squared_error(actual_array, interp_pred['mean_mag'])),
+                'r2': r2_score(actual_array, interp_pred['mean_mag'])
+            }
+            
+            extrap_metrics = {
+                'mse': mean_squared_error(actual_array, extrap_pred['mean_mag']),
+                'rmse': np.sqrt(mean_squared_error(actual_array, extrap_pred['mean_mag'])),
+                'r2': r2_score(actual_array, extrap_pred['mean_mag'])
+            }
+            
+            # Get zero crossing and AUC values
+            actual_zc = self._get_zero_crossing_from_data(diff)
+            interp_zc = self.estimate_zero_crossing(diff)
+            extrap_zc = extrapolation_model.estimate_zero_crossing(diff)
+            
+            try:
+                actual_auc = self._get_auc_from_data(diff, baseline=-1)
+                interp_auc = self.calculate_auc(diff, baseline=-1)
+                extrap_auc = extrapolation_model.calculate_auc(diff, baseline=-1)
+                
+                # Calculate errors
+                interp_zc_error = abs(actual_zc - interp_zc) if (actual_zc and interp_zc) else None
+                extrap_zc_error = abs(actual_zc - extrap_zc) if (actual_zc and extrap_zc) else None
+                
+                interp_auc_error = abs(actual_auc['positive_area'] - interp_auc['positive_area']) if (actual_auc and interp_auc) else None
+                extrap_auc_error = abs(actual_auc['positive_area'] - extrap_auc['positive_area']) if (actual_auc and extrap_auc) else None
+                
+                result = {
+                    'diffusivity': diff,
+                    'interp_rmse': interp_metrics['rmse'],
+                    'extrap_rmse': extrap_metrics['rmse'],
+                    'interp_r2': interp_metrics['r2'],
+                    'extrap_r2': extrap_metrics['r2'],
+                    'actual_zc': actual_zc,
+                    'interp_zc': interp_zc,
+                    'extrap_zc': extrap_zc,
+                    'interp_zc_error': interp_zc_error,
+                    'extrap_zc_error': extrap_zc_error,
+                    'actual_auc': actual_auc['positive_area'] if actual_auc else None,
+                    'interp_auc': interp_auc['positive_area'] if interp_auc else None,
+                    'extrap_auc': extrap_auc['positive_area'] if extrap_auc else None,
+                    'interp_auc_error': interp_auc_error,
+                    'extrap_auc_error': extrap_auc_error
+                }
+                
+                comparison_results.append(result)
+            except Exception as e:
+                print(f"Error comparing models for diffusivity {diff}: {e}")
+            
+        # Convert to DataFrame
+        comparison_df = pd.DataFrame(comparison_results)
+        
+        # Print summary
+        print("\nComparison of Interpolation vs Extrapolation Models:")
+        print("="*80)
+        print(f"{'Metric':20} {'Interpolation':15} {'Extrapolation':15} {'Improvement (%)'}")
+        print("-"*80)
+        
+        # Calculate average metrics
+        avg_interp_rmse = comparison_df['interp_rmse'].mean()
+        avg_extrap_rmse = comparison_df['extrap_rmse'].mean()
+        rmse_improvement = (1 - avg_interp_rmse / avg_extrap_rmse) * 100
+        
+        avg_interp_zc_error = comparison_df['interp_zc_error'].mean()
+        avg_extrap_zc_error = comparison_df['extrap_zc_error'].mean()
+        zc_improvement = (1 - avg_interp_zc_error / avg_extrap_zc_error) * 100
+        
+        avg_interp_auc_error = comparison_df['interp_auc_error'].mean()
+        avg_extrap_auc_error = comparison_df['extrap_auc_error'].mean()
+        auc_improvement = (1 - avg_interp_auc_error / avg_extrap_auc_error) * 100
+        
+        print(f"{'RMSE':20} {avg_interp_rmse:15.4f} {avg_extrap_rmse:15.4f} {rmse_improvement:15.2f}")
+        print(f"{'Zero-Crossing Error':20} {avg_interp_zc_error:15.4f} {avg_extrap_zc_error:15.4f} {zc_improvement:15.2f}")
+        print(f"{'AUC Error':20} {avg_interp_auc_error:15.4f} {avg_extrap_auc_error:15.4f} {auc_improvement:15.2f}")
+        
+        # Plot comparison for visualization
+        self._plot_model_comparison(comparison_df)
+        
+        return comparison_df
+    
+    def _plot_model_comparison(self, comparison_df):
+        """
+        Plot comparison between interpolation and extrapolation models
+        """
+        # Create plot
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+        
+        # Diffusivity values for x-axis
+        diffusivities = comparison_df['diffusivity']
+        
+        # Plot AUC comparison
+        bar_width = 0.25
+        x = np.arange(len(diffusivities))
+        
+        ax1.bar(x - bar_width, comparison_df['actual_auc'], bar_width, label='Actual', color='gray')
+        ax1.bar(x, comparison_df['interp_auc'], bar_width, label='Interpolation', color='blue')
+        ax1.bar(x + bar_width, comparison_df['extrap_auc'], bar_width, label='Extrapolation', color='red')
+        
+        ax1.set_xlabel('Diffusivity')
+        ax1.set_ylabel('Area Above Baseline')
+        ax1.set_title('AUC Comparison')
+        ax1.set_xticks(x)
+        ax1.set_xticklabels([f"{d:.1f}" for d in diffusivities])
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # Plot Zero-crossing comparison
+        ax2.bar(x - bar_width, comparison_df['actual_zc'], bar_width, label='Actual', color='gray')
+        ax2.bar(x, comparison_df['interp_zc'], bar_width, label='Interpolation', color='blue')
+        ax2.bar(x + bar_width, comparison_df['extrap_zc'], bar_width, label='Extrapolation', color='red')
+        
+        ax2.set_xlabel('Diffusivity')
+        ax2.set_ylabel('Zero-Crossing PKA Energy')
+        ax2.set_title('Zero-Crossing Comparison')
+        ax2.set_xticks(x)
+        ax2.set_xticklabels([f"{d:.1f}" for d in diffusivities])
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig("radism_model_comparison.png", dpi=300)
+        # Don't call plt.show() in non-interactive environments
+
+# Example usage
+if __name__ == "__main__":
+    # Path to simulation data CSV
+    data_path = "without_1.59.csv"
+    
+    # =====================================================================
+    # Example 1: Using the predefined train/test diffusivity lists
+    # =====================================================================
+    print("\n=== Using predefined diffusivity lists ===")
+    
+    # Initialize the model with predefined lists
+    model1 = InterpolativeRADISMModel(data_path, TRAIN_DIFFUSIVITIES, TEST_DIFFUSIVITIES)
+    
+    # Load and process data
+    model1.load_data()
+    model1.compute_statistical_features()
+    
+    # Split data for interpolation using the predefined diffusivity values
+    model1.split_data_for_interpolation()
+    
+    # Train models for all statistical features
+    model1.train_all_targets()
+    
+    # Evaluate performance
+    results1 = model1.evaluate_interpolation_performance()
+    
+    # Plot interpolation comparisons
+    model1.plot_interpolation_comparison()
+    
+    # =====================================================================
+    # Example 2: Using a different train/test split configuration
+    # =====================================================================
+    print("\n\n=== Using alternative diffusivity lists ===")
+    
+    # Define a different train/test split
+    alt_train = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+    alt_test = [3.5, 4.0, 4.5]
+    
+    # Initialize a new model with the alternative train/test split
+    model2 = InterpolativeRADISMModel(data_path, alt_train, alt_test)
+    
+    # Load and process data
+    model2.load_data()
+    model2.compute_statistical_features()
+    
+    # Split data for interpolation
+    model2.split_data_for_interpolation()
+    
+    # Train models
+    model2.train_all_targets()
+    
+    # Evaluate performance
+    results2 = model2.evaluate_interpolation_performance()
+    
+    # =====================================================================
+    # Example 3: Using automatic random train/test split
+    # =====================================================================
+    print("\n\n=== Using automatic random train/test split ===")
+    
+    # Initialize the model without specifying diffusivity lists
+    model3 = InterpolativeRADISMModel(data_path)
+    
+    # Load and process data
+    model3.load_data()
+    model3.compute_statistical_features()
+    
+    # Random split with 30% of diffusivity values for testing
+    model3.split_data_for_interpolation(test_size=0.3, random_state=42)
+    
+    # Train models
+    model3.train_all_targets()
+    
+    # Evaluate performance
+    results3 = model3.evaluate_interpolation_performance()
+    
+    print("\nInterpolation model training and evaluation complete!")
